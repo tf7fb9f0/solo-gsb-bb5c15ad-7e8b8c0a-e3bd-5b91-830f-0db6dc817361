@@ -41,6 +41,7 @@ docker compose up --build
 
 - `GET /health` — 健康检查
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
+- `POST /audit/vulnerabilities` — 基于 `/resolve` 的成功结果匹配本地漏洞公告并给出依赖路径
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -252,6 +253,103 @@ curl -s -X POST localhost:8000/resolve -H 'Content-Type: application/json' -d '{
 
 错误请求（非 PEP 440 版本、非法说明符、多余字段等）返回 `400/422` 并附带原因。
 
+## 漏洞审计（POST /audit/vulnerabilities）
+
+拿到 `/resolve` 的成功响应后，把其中的 `resolved` 与 `dependency_graph`
+原样回传，并附上一份**本地公告列表**，即可按解析出的实际版本匹配公告：
+
+```json
+{
+  "resolved": {"app": "1.0", "left": "1.0", "right": "1.0", "shared": "1.5"},
+  "dependency_graph": [
+    {"source": "<root>", "source_version": "", "target": "app", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "left", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "right", "target_version": "1.0"},
+    {"source": "left", "source_version": "1.0", "target": "shared", "target_version": "1.5"},
+    {"source": "right", "source_version": "1.0", "target": "shared", "target_version": "1.5"}
+  ],
+  "advisories": [
+    {"id": "GHSA-shared-1", "package": "shared", "affected": "<2.0"},
+    {"id": "GHSA-app-1", "package": "app", "affected": "==1.0"}
+  ]
+}
+```
+
+```bash
+curl -s -X POST localhost:8000/audit/vulnerabilities \
+  -H 'Content-Type: application/json' -d @audit.json
+```
+
+- `resolved`：`/resolve` 成功响应中的包名 → 选定版本。
+- `dependency_graph`：同一响应中的边列表；每条边含 `source`、
+  `source_version`、`target`、`target_version`，`<root>` 出边的
+  `source_version` 为空字符串。
+- `advisories`：本地公告数组，每项包含：
+  - `id`：公告标识（如 GHSA/CVE 编号），非空字符串；
+  - `package`：受影响包名（与 `resolved` 一样按 PEP 503 规范化匹配，
+    即 `Some_Pkg` 与 `some-pkg` 视为同一包）；
+  - `affected`：受影响版本的 PEP 440 说明符（如 `<2.0`、`>=1.0,<1.5`）；
+    空字符串表示命中任意版本。
+
+服务会先校验图与版本的一致性，再按 `resolved` 中的版本匹配公告。
+
+### 成功响应（200）
+
+```json
+{
+  "findings": [
+    {
+      "advisory": {"id": "GHSA-app-1", "package": "app", "affected": "==1.0"},
+      "package": "app",
+      "version": "1.0",
+      "paths": [[{"name": "<root>", "version": ""}, {"name": "app", "version": "1.0"}]]
+    },
+    {
+      "advisory": {"id": "GHSA-shared-1", "package": "shared", "affected": "<2.0"},
+      "package": "shared",
+      "version": "1.5",
+      "paths": [
+        [{"name": "<root>", "version": ""}, {"name": "app", "version": "1.0"},
+         {"name": "left", "version": "1.0"}, {"name": "shared", "version": "1.5"}],
+        [{"name": "<root>", "version": ""}, {"name": "app", "version": "1.0"},
+         {"name": "right", "version": "1.0"}, {"name": "shared", "version": "1.5"}]
+      ]
+    }
+  ],
+  "orphaned": []
+}
+```
+
+响应字段：
+
+- `findings`：可从 `<root>` 到达的命中项，按 `(package, advisory id)`
+  稳定排序；每项包含：
+  - `advisory`：命中的公告原文；
+  - `package`：规范化包名；
+  - `version`：该包在 `resolved` 中的版本；
+  - `paths`：从 `<root>` 到该包的**全部最短路径**。图中存在菱形依赖时会
+    返回多条（如上例）；存在环时也不会无限遍历（BFS 按层展开，只保留最短路
+    前驱），每条路径自身不重复节点；路径按节点序列（包名、版本）字典序
+    稳定排序。
+- `orphaned`：公告与版本命中、但该包**无法从 `<root>` 到达**的命中项
+  （例如 `resolved` 中存在、却没有任何来自根的边）。结构与 `findings`
+  相同，但**不含** `paths`。
+- 公告针对的包不在 `resolved` 中、或说明符不匹配解析版本时，不出现在任何
+  列表中；`advisories` 为空时两个列表均为 `[]`。
+
+### 审计请求的 400 校验
+
+以下情况返回 `400 invalid_request`（多个问题会合并在一条 message 中）：
+
+- `resolved` 中的版本不是合法 PEP 440 版本；
+- 公告的 `affected` 不是合法 PEP 440 说明符，或 `id`/`package` 为空；
+- **悬空边**：边的 `source`（除 `<root>` 外）或 `target` 指向
+  `resolved` 中不存在的包；
+- **边版本不一致**：`source_version`/`target_version` 与 `resolved` 中
+  对应版本不一致；`<root>` 出边的 `source_version` 非空。
+
+多余字段、字段类型错误等结构问题按 FastAPI 约定返回 `422`。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -286,8 +384,9 @@ pytest -q
 app/
   resolver.py    # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
   serialize.py   # 冲突树 / 终态冲突的 JSON 序列化
+  audit.py       # /audit/vulnerabilities：图一致性校验、公告匹配、最短路径枚举（含环/菱形）
   jobs.py        # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py        # FastAPI 应用与 /resolve、/jobs、/health
+  main.py        # FastAPI 应用与 /resolve、/audit/vulnerabilities、/jobs、/health
 tests/           # 端到端 API 测试、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/            # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
