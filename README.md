@@ -28,6 +28,10 @@
   默认环境下求值（可用 `marker_env` 覆盖），保证结果可复现。
 - **同步 + 异步两种用法**：`POST /resolve` 立即返回；`POST /jobs` 把同样的请求
   持久化到 SQLite 后由后台 worker 顺序执行，可查询、可协作取消，重启自动恢复。
+- **漏洞审计**：`POST /audit/vulnerabilities` 直接接收 `/resolve` 成功响应中的
+  `resolved` 与 `dependency_graph`，对照本地公告列表（PEP 440 受影响范围）匹配
+  已解析版本；每个命中项给出从 `<root>` 到该包的**全部最短路径**（支持环与菱形
+  依赖，路径去重并按节点序列稳定排序），不可达命中单列为 `orphaned`。
 
 ## 一条命令启动
 
@@ -41,6 +45,7 @@ docker compose up --build
 
 - `GET /health` — 健康检查
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
+- `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -128,6 +133,86 @@ worker 以单条 `BEGIN IMMEDIATE` 事务原子领取最早的 `queued` 作业�
 FIFO），因此即使将来扩容为多个 worker 也不会重复领取同一作业。每次启动时，
 上一进程遗留的 `running` 作业会被退回 `queued` 重新排队；若遗留作业此前已收到
 取消请求，则直接终结为 `cancelled`。
+
+## 漏洞审计 API
+
+`POST /audit/vulnerabilities` 接收 `/resolve` **成功响应**中的 `resolved` 与
+`dependency_graph`，外加一份本地公告列表，按已解析版本匹配受影响的包：
+
+```bash
+curl -s -X POST localhost:8000/audit/vulnerabilities \
+  -H 'Content-Type: application/json' -d '{
+  "resolved": {"app": "1.0", "db": "1.0", "web": "2.0", "common": "1.5"},
+  "dependency_graph": [
+    {"source": "<root>", "source_version": "", "target": "app", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "db", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "web", "target_version": "2.0"},
+    {"source": "db", "source_version": "1.0", "target": "common", "target_version": "1.5"},
+    {"source": "web", "source_version": "2.0", "target": "common", "target_version": "1.5"}
+  ],
+  "advisories": [
+    {"id": "CVE-2026-0001", "package": "common", "affected": ">=1.0,<1.6"}
+  ]
+}'
+```
+
+请求字段：
+
+- `resolved`：包名 → 已解析版本（PEP 440），即 `/resolve` 的 `resolved`。
+- `dependency_graph`：边列表，即 `/resolve` 的 `dependency_graph`；每条边含
+  `source` / `source_version` / `target` / `target_version`（`<root>` 边的
+  `source_version` 为空字符串）。
+- `advisories`：本地公告列表，每条含 `id`、`package`、`affected`
+  （受影响版本的 PEP 440 说明符，如 `>=1.0,<1.6`；空字符串表示全部版本）。
+
+响应（200）：
+
+```json
+{
+  "status": "ok",
+  "summary": {"advisories": 1, "matches": 1, "orphaned": 0},
+  "matches": [
+    {
+      "advisory": {"id": "CVE-2026-0001", "package": "common", "affected": ">=1.0,<1.6"},
+      "package": "common",
+      "version": "1.5",
+      "paths": [
+        [
+          {"name": "<root>", "version": ""},
+          {"name": "app", "version": "1.0"},
+          {"name": "db", "version": "1.0"},
+          {"name": "common", "version": "1.5"}
+        ],
+        [
+          {"name": "<root>", "version": ""},
+          {"name": "app", "version": "1.0"},
+          {"name": "web", "version": "2.0"},
+          {"name": "common", "version": "1.5"}
+        ]
+      ]
+    }
+  ],
+  "orphaned": []
+}
+```
+
+- `matches`：每条命中一项，含公告原文、命中包与版本，以及从 `<root>` 到该包的
+  **全部最短路径**（菱形依赖会给出多条；路径去重并按节点序列稳定排序，相同输入
+  永远得到相同输出）。图允许含环——路径枚举只在 BFS 层数递增的边上前进，绝不
+  因环无限遍历。
+- `orphaned`：版本命中但无法从 `<root>` 到达的包（无 `paths` 字段），单列以便
+  人工核查。
+- 版本匹配与求解器口径一致：按 PEP 440 说明符判定，已解析的预发布版本同样参与
+  匹配。
+
+校验规则（违反即返回 `400`，错误体与 `/resolve` 相同）：
+
+- `resolved` 中的版本必须是合法 PEP 440 版本；
+- 公告的 `affected` 必须是合法 PEP 440 说明符；
+- 边的 `source`（`<root>` 除外）与 `target` 必须出现在 `resolved` 中，否则视为
+  悬空边；
+- 边的 `source_version` / `target_version` 必须与 `resolved` 中对应版本一致
+  （`<root>` 边的 `source_version` 必须为空）。
 
 ## 数据持久化
 
@@ -286,9 +371,10 @@ pytest -q
 app/
   resolver.py    # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
   serialize.py   # 冲突树 / 终态冲突的 JSON 序列化
+  audit.py       # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   jobs.py        # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py        # FastAPI 应用与 /resolve、/jobs、/health
-tests/           # 端到端 API 测试、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py        # FastAPI 应用与 /resolve、/audit/vulnerabilities、/jobs、/health
+tests/           # 端到端 API 测试（含漏洞审计）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/            # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml

@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .audit import run_audit
 from .jobs import (
     CANCELLED,
     FAILED,
@@ -60,6 +61,43 @@ class ResolveRequest(BaseModel):
     max_attempts: int = Field(
         default=100_000, ge=1, le=10_000_000,
         description="Bound on candidate evaluations to keep resolution finite.",
+    )
+
+
+class AdvisoryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="Local advisory identifier.")
+    package: str = Field(..., description="Affected package name.")
+    affected: str = Field(
+        ..., description="PEP 440 specifier of the affected version range."
+    )
+
+
+class GraphEdgeInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(..., description="Requiring package, or '<root>'.")
+    source_version: str = Field(
+        ..., description="Resolved version of the source ('' for '<root>')."
+    )
+    target: str = Field(..., description="Required package.")
+    target_version: str = Field(..., description="Resolved version of the target.")
+
+
+class AuditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, str] = Field(
+        ..., description="Package -> resolved version, as returned by /resolve."
+    )
+    dependency_graph: list[GraphEdgeInput] = Field(
+        default_factory=list,
+        description="Edges as returned by /resolve.",
+    )
+    advisories: list[AdvisoryInput] = Field(
+        default_factory=list,
+        description="Local advisories to match against the resolved versions.",
     )
 
 
@@ -188,6 +226,19 @@ def run_resolution_job(
 async def resolve_endpoint(payload: ResolveRequest) -> JSONResponse:
     body, status_code, _error, _attempts = _resolve_body(payload)
     return JSONResponse(status_code=status_code, content=body)
+
+
+@app.post("/audit/vulnerabilities")
+async def audit_vulnerabilities_endpoint(payload: AuditRequest) -> JSONResponse:
+    """Match local advisories against a resolved dependency graph.
+
+    Takes the ``resolved`` mapping and ``dependency_graph`` edges from a
+    successful ``/resolve`` response plus a list of local advisories.  Every
+    hit reports the advisory, the resolved package version, and all shortest
+    ``<root>`` -> package paths; unreachable hits are listed as ``orphaned``.
+    """
+    body = run_audit(payload.resolved, payload.dependency_graph, payload.advisories)
+    return JSONResponse(status_code=200, content=body)
 
 
 # ---------------------------------------------------------------------------
